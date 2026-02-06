@@ -6,19 +6,22 @@ from pyspark.sql.types import StringType
 from pyspark.sql import functions as F
 
 import re
+import json
+import os
+import logging
 
 # ===========================
 # ⚙️ CẤU HÌNH ORACLE DATABASE
 # ===========================
-oracle_url = "jdbc:oracle:thin:@//34.126.123.190/MYATP_low.adb.oraclecloud.com"
+oracle_url = "jdbc:oracle:thin:@//136.110.60.196/XEPDB1"
 oracle_properties = {
-    "user": "ADMIN",
-    "password": "Abcd12345678!",
+    "user": "CLOUD",
+    "password": "cloud123",
     "driver": "oracle.jdbc.driver.OracleDriver"
 }
 # Ví dụ:
 # oracle_url = "jdbc:oracle:thin:@//localhost:1521/XEPDB1"
-# oracle_properties = {"user": "ADMIN", "password": "admin123", "driver": "oracle.jdbc.driver.OracleDriver"}
+# oracle_properties = {"user": "CLOUD", "password": "admin123", "driver": "oracle.jdbc.driver.OracleDriver"}
 
 # ===========================
 # 🚀 KHỞI TẠO SPARK SESSION
@@ -29,10 +32,14 @@ spark = SparkSession.builder \
     .config("spark.jars", "C:\\Users\\namhh\\ojdbc11.jar") \
     .config("spark.driver.extraClassPath", "C:\\Users\\namhh\\ojdbc11.jar") \
     .config("spark.executor.extraClassPath", "C:\\Users\\namhh\\ojdbc11.jar") \
+    .config("spark.sql.streaming.kafka.maxOffsetsPerTrigger", "1000") \
     .getOrCreate()
 
 
 spark.sparkContext.setLogLevel("WARN")
+# Suppress KAFKA-1894 warnings about UninterruptibleThread
+logging.getLogger("org.apache.spark.streaming.kafka").setLevel("ERROR")
+logging.getLogger("org.apache.kafka.clients").setLevel("ERROR")
 
 # ===========================
 # 🧩 SCHEMA JSON KAFKA
@@ -137,12 +144,16 @@ kafka_df = spark \
     .format("kafka") \
     .option("kafka.bootstrap.servers", "localhost:9092") \
     .option("subscribe", "vietnam-gold-price-topic") \
-    .option("startingOffsets", "earliest") \
+    .option("startingOffsets", "latest") \
+    .option("failOnDataLoss", "false") \
     .load()
 
 json_df = kafka_df.select(
+    col("value").cast("string").alias("raw_value"),
     decode(col("value"), "Cp1258").alias("json_payload"), 
-    col("timestamp")
+    col("timestamp"),
+    col("offset"),
+    col("partition")
 )
 
 parsed_df = json_df \
@@ -154,7 +165,9 @@ parsed_df = json_df \
         col("item.cong_ty").alias("CongTy"),
         col("item.mua").alias("mua_raw"),
         col("item.ban").alias("ban_raw"),
-        col("timestamp").alias("KafkaTimestamp")
+        col("timestamp").alias("KafkaTimestamp"),
+        col("offset").alias("KafkaOffset"),
+        col("partition").alias("KafkaPartition")
     )
 
 parsed_df = parsed_df \
@@ -166,6 +179,8 @@ parsed_df = parsed_df \
         col("mua_raw"),
         col("ban_raw"),
         date_format(col("KafkaTimestamp"), "yyyy-MM-dd'T'HH:mm:ss.SSSSSS").alias("KafkaTimestamp"),
+        col("KafkaOffset"),
+        col("KafkaPartition"),
         col("parsed_info.location").alias("Location"),
         col("location_info.city").alias("City"),
         col("location_info.region").alias("Region"),
@@ -185,14 +200,19 @@ parsed_df = parsed_df \
 # 💾 GHI XUỐNG ORACLE
 # ===========================
 def upsert_dimensions_and_fact(batch_df, batch_id):
-    if batch_df.count() == 0:
+    print(f"\n========== BATCH {batch_id} START ==========")
+    batch_count = batch_df.count()
+    print(f"[BATCH {batch_id}] Received {batch_count} records")
+    
+    if batch_count == 0:
+        print(f"[BATCH {batch_id}] Empty batch, skipping")
         return
 
     # ====== Load dimensions ======
-    source_dim = spark.read.jdbc(oracle_url, "ADMIN.SOURCE_DIMENSION", properties=oracle_properties)
-    type_dim = spark.read.jdbc(oracle_url, "ADMIN.GOLD_TYPE_DIMENSION", properties=oracle_properties)
-    loc_dim = spark.read.jdbc(oracle_url, "ADMIN.LOCATION_DIMENSION", properties=oracle_properties)
-    time_dim = spark.read.jdbc(oracle_url, "ADMIN.TIME_DIMENSION", properties=oracle_properties)
+    source_dim = spark.read.jdbc(oracle_url, "CLOUD.SOURCE_DIMENSION", properties=oracle_properties)
+    type_dim = spark.read.jdbc(oracle_url, "CLOUD.GOLD_TYPE_DIMENSION", properties=oracle_properties)
+    loc_dim = spark.read.jdbc(oracle_url, "CLOUD.LOCATION_DIMENSION", properties=oracle_properties)
+    time_dim = spark.read.jdbc(oracle_url, "CLOUD.TIME_DIMENSION", properties=oracle_properties)
 
     # Chuẩn hoá dữ liệu incoming
     df = (
@@ -211,8 +231,8 @@ def upsert_dimensions_and_fact(batch_df, batch_id):
     new_sources = df.select("SOURCE_NAME").distinct() \
         .join(source_dim, "SOURCE_NAME", "left_anti")
     if new_sources.limit(1).count() > 0:
-        new_sources.write.jdbc(oracle_url, "ADMIN.SOURCE_DIMENSION", "append", properties=oracle_properties)
-        source_dim = spark.read.jdbc(oracle_url, "ADMIN.SOURCE_DIMENSION", properties=oracle_properties)
+        new_sources.write.jdbc(oracle_url, "CLOUD.SOURCE_DIMENSION", "append", properties=oracle_properties)
+        source_dim = spark.read.jdbc(oracle_url, "CLOUD.SOURCE_DIMENSION", properties=oracle_properties)
 
     # ----------------------------
     # GOLD_TYPE_DIMENSION (với BRAND = SOURCE_NAME)
@@ -251,14 +271,14 @@ def upsert_dimensions_and_fact(batch_df, batch_id):
             )
             .write.jdbc(
                 oracle_url,
-                "ADMIN.GOLD_TYPE_DIMENSION",
+                "CLOUD.GOLD_TYPE_DIMENSION",
                 "append",
                 properties=oracle_properties
             )
         )
 
     # reload lại dimension sau khi insert
-    type_dim = spark.read.jdbc(oracle_url, "ADMIN.GOLD_TYPE_DIMENSION", properties=oracle_properties)
+    type_dim = spark.read.jdbc(oracle_url, "CLOUD.GOLD_TYPE_DIMENSION", properties=oracle_properties)
 
 
     # ----------------------------
@@ -281,9 +301,9 @@ def upsert_dimensions_and_fact(batch_df, batch_id):
                 F.col("src.City").alias("CITY"),
                 F.col("src.Region").alias("REGION")
             )
-            .write.jdbc(oracle_url, "ADMIN.LOCATION_DIMENSION", "append", properties=oracle_properties)
+            .write.jdbc(oracle_url, "CLOUD.LOCATION_DIMENSION", "append", properties=oracle_properties)
         )
-        loc_dim = spark.read.jdbc(oracle_url, "ADMIN.LOCATION_DIMENSION", properties=oracle_properties)
+        loc_dim = spark.read.jdbc(oracle_url, "CLOUD.LOCATION_DIMENSION", properties=oracle_properties)
     # ----------------------------
     # ===== TIME_DIMENSION (fix: keep timestamp & extract hour) =====
 
@@ -294,7 +314,7 @@ def upsert_dimensions_and_fact(batch_df, batch_id):
     ).distinct().alias("src")
 
     # prepare existing time_dim
-    time_dim = spark.read.jdbc(oracle_url, "ADMIN.TIME_DIMENSION", properties=oracle_properties)
+    time_dim = spark.read.jdbc(oracle_url, "CLOUD.TIME_DIMENSION", properties=oracle_properties)
     time_dim_alias = time_dim.alias("dim")
 
     # compare on DATE (or on exact timestamp; here we compare date+hour to be safe)
@@ -327,10 +347,10 @@ def upsert_dimensions_and_fact(batch_df, batch_id):
         )
         # debug:
         # to_insert_times.printSchema(); to_insert_times.show(truncate=False)
-        to_insert_times.write.jdbc(oracle_url, "ADMIN.TIME_DIMENSION", "append", properties=oracle_properties)
+        to_insert_times.write.jdbc(oracle_url, "CLOUD.TIME_DIMENSION", "append", properties=oracle_properties)
 
     # reload
-    time_dim = spark.read.jdbc(oracle_url, "ADMIN.TIME_DIMENSION", properties=oracle_properties)
+    time_dim = spark.read.jdbc(oracle_url, "CLOUD.TIME_DIMENSION", properties=oracle_properties)
 
 
     # ----------------------------
@@ -359,11 +379,53 @@ def upsert_dimensions_and_fact(batch_df, batch_id):
             df.GiaMua.alias("BUY_PRICE"),
             df.GiaBan.alias("SELL_PRICE"),
             F.lit("VNĐ/Lượng").alias("UNIT"),
-            F.to_timestamp(df.KafkaTimestamp).alias("RECORDED_AT")
+            F.to_timestamp(df.KafkaTimestamp).alias("RECORDED_AT"),
+            F.lit("hainam").alias("RECORDED_BY")
         )
     )
 
-    fact_df.write.jdbc(oracle_url, "ADMIN.GOLD_PRICE_FACT", "append", properties=oracle_properties)
+    # # Kiểm tra NULL IDs trước khi ghi vào GOLD_PRICE_FACT
+    # missing = fact_df.filter(
+    #     F.col("SOURCE_ID").isNull() |
+    #     F.col("TYPE_ID").isNull() |
+    #     F.col("LOCATION_ID").isNull() |
+    #     F.col("TIME_ID").isNull()
+    # )
+
+    # if missing.limit(1).count() > 0:
+    #     # Lưu mẫu thiếu vào file UTF-8 để tránh lỗi encoding (Windows console cp1252 không thể in ký tự Unicode)
+    #     rows = [r.asDict() for r in missing.collect()]
+    #     # Chuyển các giá trị không serialize được (datetime, Decimal, ...) sang dạng chuỗi/float an toàn
+    #     def sanitize(obj):
+    #         if isinstance(obj, dict):
+    #             return {k: sanitize(v) for k, v in obj.items()}
+    #         if isinstance(obj, list):
+    #             return [sanitize(v) for v in obj]
+    #         if isinstance(obj, datetime):
+    #             return obj.isoformat()
+    #         try:
+    #             import decimal
+    #             if isinstance(obj, decimal.Decimal):
+    #                 return float(obj)
+    #         except Exception:
+    #             pass
+    #         if isinstance(obj, (str, int, float, bool)) or obj is None:
+    #             return obj
+    #         return str(obj)
+
+    #     sanitized = [sanitize(r) for r in rows]
+    #     # limit to at most 1000 rows to avoid OOM on driver when batch huge
+    #     to_save = sanitized if len(sanitized) <= 1000 else sanitized[:1000]
+    #     os.makedirs(r"C:\tmp\spark_errors", exist_ok=True)
+    #     file_path = os.path.join(r"C:\tmp\spark_errors", f"missing_ids_batch_{batch_id}.json")
+    #     with open(file_path, "w", encoding="utf-8") as f:
+    #         json.dump(to_save, f, ensure_ascii=False, indent=2)
+    #     # Ghi log ngắn (ASCII-only) và dừng để không ghi fact không đầy đủ
+    #     truncated_msg = " (truncated to 1000 rows)" if len(sanitized) > 1000 else ""
+    #     print(f"Missing dimension IDs detected: {len(sanitized)} rows saved to {file_path}{truncated_msg}")
+    #     raise Exception(f"Missing dimension IDs detected — aborting fact write; saved to {file_path}{truncated_msg}")
+
+    fact_df.write.jdbc(oracle_url, "CLOUD.GOLD_PRICE_FACT", "append", properties=oracle_properties)
 
 # ===========================
 # ▶️ KHỞI CHẠY STREAMING
