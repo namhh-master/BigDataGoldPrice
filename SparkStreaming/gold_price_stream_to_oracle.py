@@ -200,12 +200,7 @@ parsed_df = parsed_df \
 # 💾 GHI XUỐNG ORACLE
 # ===========================
 def upsert_dimensions_and_fact(batch_df, batch_id):
-    print(f"\n========== BATCH {batch_id} START ==========")
-    batch_count = batch_df.count()
-    print(f"[BATCH {batch_id}] Received {batch_count} records")
-    
-    if batch_count == 0:
-        print(f"[BATCH {batch_id}] Empty batch, skipping")
+    if batch_df.count() == 0:
         return
 
     # ====== Load dimensions ======
