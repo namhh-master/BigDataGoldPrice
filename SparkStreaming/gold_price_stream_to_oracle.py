@@ -13,15 +13,12 @@ import logging
 # ===========================
 # ⚙️ CẤU HÌNH ORACLE DATABASE
 # ===========================
-oracle_url = "jdbc:oracle:thin:@//136.110.60.196/XEPDB1"
+oracle_url = "jdbc:oracle:thin:@//136.110.60.196:1521/XEPDB1"
 oracle_properties = {
-    "user": "CLOUD",
-    "password": "cloud123",
+    "user": "SYSTEM",
+    "password": "Welcome_1234",
     "driver": "oracle.jdbc.driver.OracleDriver"
 }
-# Ví dụ:
-# oracle_url = "jdbc:oracle:thin:@//localhost:1521/XEPDB1"
-# oracle_properties = {"user": "CLOUD", "password": "admin123", "driver": "oracle.jdbc.driver.OracleDriver"}
 
 # ===========================
 # 🚀 KHỞI TẠO SPARK SESSION
@@ -204,10 +201,10 @@ def upsert_dimensions_and_fact(batch_df, batch_id):
         return
 
     # ====== Load dimensions ======
-    source_dim = spark.read.jdbc(oracle_url, "CLOUD.SOURCE_DIMENSION", properties=oracle_properties)
-    type_dim = spark.read.jdbc(oracle_url, "CLOUD.GOLD_TYPE_DIMENSION", properties=oracle_properties)
-    loc_dim = spark.read.jdbc(oracle_url, "CLOUD.LOCATION_DIMENSION", properties=oracle_properties)
-    time_dim = spark.read.jdbc(oracle_url, "CLOUD.TIME_DIMENSION", properties=oracle_properties)
+    source_dim = spark.read.jdbc(oracle_url, "SYSTEM.SOURCE_DIMENSION", properties=oracle_properties)
+    type_dim = spark.read.jdbc(oracle_url, "SYSTEM.GOLD_TYPE_DIMENSION", properties=oracle_properties)
+    loc_dim = spark.read.jdbc(oracle_url, "SYSTEM.LOCATION_DIMENSION", properties=oracle_properties)
+    time_dim = spark.read.jdbc(oracle_url, "SYSTEM.TIME_DIMENSION", properties=oracle_properties)
 
     # Chuẩn hoá dữ liệu incoming
     df = (
@@ -226,8 +223,8 @@ def upsert_dimensions_and_fact(batch_df, batch_id):
     new_sources = df.select("SOURCE_NAME").distinct() \
         .join(source_dim, "SOURCE_NAME", "left_anti")
     if new_sources.limit(1).count() > 0:
-        new_sources.write.jdbc(oracle_url, "CLOUD.SOURCE_DIMENSION", "append", properties=oracle_properties)
-        source_dim = spark.read.jdbc(oracle_url, "CLOUD.SOURCE_DIMENSION", properties=oracle_properties)
+        new_sources.write.jdbc(oracle_url, "SYSTEM.SOURCE_DIMENSION", "append", properties=oracle_properties)
+        source_dim = spark.read.jdbc(oracle_url, "SYSTEM.SOURCE_DIMENSION", properties=oracle_properties)
 
     # ----------------------------
     # GOLD_TYPE_DIMENSION (với BRAND = SOURCE_NAME)
@@ -266,14 +263,14 @@ def upsert_dimensions_and_fact(batch_df, batch_id):
             )
             .write.jdbc(
                 oracle_url,
-                "CLOUD.GOLD_TYPE_DIMENSION",
+                "SYSTEM.GOLD_TYPE_DIMENSION",
                 "append",
                 properties=oracle_properties
             )
         )
 
     # reload lại dimension sau khi insert
-    type_dim = spark.read.jdbc(oracle_url, "CLOUD.GOLD_TYPE_DIMENSION", properties=oracle_properties)
+    type_dim = spark.read.jdbc(oracle_url, "SYSTEM.GOLD_TYPE_DIMENSION", properties=oracle_properties)
 
 
     # ----------------------------
@@ -296,9 +293,9 @@ def upsert_dimensions_and_fact(batch_df, batch_id):
                 F.col("src.City").alias("CITY"),
                 F.col("src.Region").alias("REGION")
             )
-            .write.jdbc(oracle_url, "CLOUD.LOCATION_DIMENSION", "append", properties=oracle_properties)
+            .write.jdbc(oracle_url, "SYSTEM.LOCATION_DIMENSION", "append", properties=oracle_properties)
         )
-        loc_dim = spark.read.jdbc(oracle_url, "CLOUD.LOCATION_DIMENSION", properties=oracle_properties)
+        loc_dim = spark.read.jdbc(oracle_url, "SYSTEM.LOCATION_DIMENSION", properties=oracle_properties)
     # ----------------------------
     # ===== TIME_DIMENSION (fix: keep timestamp & extract hour) =====
 
@@ -309,7 +306,7 @@ def upsert_dimensions_and_fact(batch_df, batch_id):
     ).distinct().alias("src")
 
     # prepare existing time_dim
-    time_dim = spark.read.jdbc(oracle_url, "CLOUD.TIME_DIMENSION", properties=oracle_properties)
+    time_dim = spark.read.jdbc(oracle_url, "SYSTEM.TIME_DIMENSION", properties=oracle_properties)
     time_dim_alias = time_dim.alias("dim")
 
     # compare on DATE (or on exact timestamp; here we compare date+hour to be safe)
@@ -342,10 +339,10 @@ def upsert_dimensions_and_fact(batch_df, batch_id):
         )
         # debug:
         # to_insert_times.printSchema(); to_insert_times.show(truncate=False)
-        to_insert_times.write.jdbc(oracle_url, "CLOUD.TIME_DIMENSION", "append", properties=oracle_properties)
+        to_insert_times.write.jdbc(oracle_url, "SYSTEM.TIME_DIMENSION", "append", properties=oracle_properties)
 
     # reload
-    time_dim = spark.read.jdbc(oracle_url, "CLOUD.TIME_DIMENSION", properties=oracle_properties)
+    time_dim = spark.read.jdbc(oracle_url, "SYSTEM.TIME_DIMENSION", properties=oracle_properties)
 
 
     # ----------------------------
@@ -379,48 +376,7 @@ def upsert_dimensions_and_fact(batch_df, batch_id):
         )
     )
 
-    # # Kiểm tra NULL IDs trước khi ghi vào GOLD_PRICE_FACT
-    # missing = fact_df.filter(
-    #     F.col("SOURCE_ID").isNull() |
-    #     F.col("TYPE_ID").isNull() |
-    #     F.col("LOCATION_ID").isNull() |
-    #     F.col("TIME_ID").isNull()
-    # )
-
-    # if missing.limit(1).count() > 0:
-    #     # Lưu mẫu thiếu vào file UTF-8 để tránh lỗi encoding (Windows console cp1252 không thể in ký tự Unicode)
-    #     rows = [r.asDict() for r in missing.collect()]
-    #     # Chuyển các giá trị không serialize được (datetime, Decimal, ...) sang dạng chuỗi/float an toàn
-    #     def sanitize(obj):
-    #         if isinstance(obj, dict):
-    #             return {k: sanitize(v) for k, v in obj.items()}
-    #         if isinstance(obj, list):
-    #             return [sanitize(v) for v in obj]
-    #         if isinstance(obj, datetime):
-    #             return obj.isoformat()
-    #         try:
-    #             import decimal
-    #             if isinstance(obj, decimal.Decimal):
-    #                 return float(obj)
-    #         except Exception:
-    #             pass
-    #         if isinstance(obj, (str, int, float, bool)) or obj is None:
-    #             return obj
-    #         return str(obj)
-
-    #     sanitized = [sanitize(r) for r in rows]
-    #     # limit to at most 1000 rows to avoid OOM on driver when batch huge
-    #     to_save = sanitized if len(sanitized) <= 1000 else sanitized[:1000]
-    #     os.makedirs(r"C:\tmp\spark_errors", exist_ok=True)
-    #     file_path = os.path.join(r"C:\tmp\spark_errors", f"missing_ids_batch_{batch_id}.json")
-    #     with open(file_path, "w", encoding="utf-8") as f:
-    #         json.dump(to_save, f, ensure_ascii=False, indent=2)
-    #     # Ghi log ngắn (ASCII-only) và dừng để không ghi fact không đầy đủ
-    #     truncated_msg = " (truncated to 1000 rows)" if len(sanitized) > 1000 else ""
-    #     print(f"Missing dimension IDs detected: {len(sanitized)} rows saved to {file_path}{truncated_msg}")
-    #     raise Exception(f"Missing dimension IDs detected — aborting fact write; saved to {file_path}{truncated_msg}")
-
-    fact_df.write.jdbc(oracle_url, "CLOUD.GOLD_PRICE_FACT", "append", properties=oracle_properties)
+    fact_df.write.jdbc(oracle_url, "SYSTEM.GOLD_PRICE_FACT", "append", properties=oracle_properties)
 
 # ===========================
 # ▶️ KHỞI CHẠY STREAMING
