@@ -12,8 +12,10 @@ import main.spark.util.LocationMap;
 import org.apache.spark.sql.Dataset;
 import org.apache.spark.sql.Row;
 import org.apache.spark.sql.SparkSession;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 
+import jakarta.annotation.PostConstruct;
 import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
@@ -30,23 +32,37 @@ public class SparkJobService {
     private final SparkSession spark;
     private final GoldPriceFactRepository factRepository;
     private final SourceDimensionRepository sourceDimensionRepository;
-    //    private final GoldTypeDimensionRepository goldTypeDimensionRepository;
+    // private final GoldTypeDimensionRepository goldTypeDimensionRepository;
     private final LocationDimensionRepository locationDimensionRepository;
     private final TimeDimensionRepository timeDimensionRepository;
     private final GoldTypeService goldTypeService;
 
-    private final String hdfsPath = "hdfs://192.168.38.88:9000/user/totuong/data/sjc_prices.json";
-    private final String hdfsPathPnj = "hdfs://192.168.38.88:9000/user/totuong/data/pnj_gold.json";
+    @Value("${spark.hdfs-uri}")
+    private String hdfsUri;
+    @Value("${spark.sjc-path}")
+    private String sjcPath;
+    @Value("${spark.pnj-path}")
+    private String pnjPath;
+
+    private String fullSjcPath;
+    private String fullPnjPath;
     final DateTimeFormatter DF = DateTimeFormatter.ofPattern("dd/MM/yyyy");
+
+    @PostConstruct
+    public void init() {
+        this.fullSjcPath = hdfsUri + sjcPath;
+        this.fullPnjPath = hdfsUri + pnjPath;
+    }
+
     private static final int BATCH_SIZE = 500;
 
     public void syncSJC() {
-        log.info("🚀 Bắt đầu đọc dữ liệu từ HDFS: {}", hdfsPath);
+        log.info("🚀 Bắt đầu đọc dữ liệu từ HDFS: {}", fullSjcPath);
 
         // 1️⃣ Đọc file JSON
         Dataset<Row> df = spark.read()
                 .option("multiline", "true")
-                .json(hdfsPath);
+                .json(fullSjcPath);
 
         log.info("✅ Schema ban đầu:");
         df.printSchema();
@@ -132,7 +148,8 @@ public class SparkJobService {
 
             // 🔹 LocationDimension
             String branch = row.getAs("branch_name");
-            if (branch == null) branch = "";
+            if (branch == null)
+                branch = "";
 
             branch = branch.trim()
                     .replaceAll("\\s+", " ")
@@ -141,7 +158,7 @@ public class SparkJobService {
             String city = "Unknown";
             String region = "Unknown";
 
-// Tìm trong map các tỉnh/thành
+            // Tìm trong map các tỉnh/thành
             for (Map.Entry<String, String> e : LocationMap.regionMap.entrySet()) {
                 if (branch.contains(e.getKey())) {
                     city = LocationMap.capitalizeWords(e.getKey());
@@ -155,7 +172,8 @@ public class SparkJobService {
 
             LocationDimension existingLoc;
             if (finalCity != null) {
-                existingLoc = locationDimensionRepository.findByCityIsAndRegionIs(finalCity, finalRegion).orElse(new LocationDimension());
+                existingLoc = locationDimensionRepository.findByCityIsAndRegionIs(finalCity, finalRegion)
+                        .orElse(new LocationDimension());
             } else {
                 existingLoc = new LocationDimension();
             }
@@ -166,7 +184,7 @@ public class SparkJobService {
             fact.setLocationDimension(existingLoc);
 
             // 🔹 TimeDimension
-            String dateStr = row.getAs("date");         // ví dụ "27/10/2025"
+            String dateStr = row.getAs("date"); // ví dụ "27/10/2025"
             if (dateStr == null || dateStr.isBlank()) {
                 log.warn("⚠️ Bỏ qua bản ghi vì thiếu field 'date'");
                 return null;
@@ -176,7 +194,6 @@ public class SparkJobService {
             Integer day = d.getDayOfMonth();
             Integer month = d.getMonthValue();
             Integer year = d.getYear();
-
 
             TimeDimension time = timeDimensionRepository.findByDayIsAndMonthIsAndYearIsAndHourIs(day, month, year, 12)
                     .orElseGet(() -> {
@@ -199,20 +216,19 @@ public class SparkJobService {
         }
     }
 
-
     public void syncNestedPrices() {
-        log.info("🚀 Đọc JSON nested: {}", hdfsPath);
+        log.info("🚀 Đọc JSON nested: {}", fullPnjPath);
 
         // 1) Đọc file: là 1 mảng JSON duy nhất -> cần multiline=true
 
         Dataset<Row> raw = spark.read()
                 .option("multiline", "true")
-                .json(hdfsPathPnj);
+                .json(fullPnjPath);
 
-// 🔹 Bỏ các record không có location hợp lệ
+        // 🔹 Bỏ các record không có location hợp lệ
         Dataset<Row> filtered = raw.filter("data.locations IS NOT NULL AND size(data.locations) > 0");
 
-// 🔹 Flatten
+        // 🔹 Flatten
         Dataset<Row> flat = filtered
                 .withColumn("date_raw", col("date"))
                 .withColumn("location", explode(col("data.locations")))
@@ -226,8 +242,7 @@ public class SparkJobService {
                         col("gold.name").alias("type_name"),
                         col("point.gia_mua").alias("buy_raw"),
                         col("point.gia_ban").alias("sell_raw"),
-                        col("point.updated_at").alias("updated_at")
-                );
+                        col("point.updated_at").alias("updated_at"));
 
         long total = flat.count();
         log.info("✅ Flatten xong, tổng dòng: {}", total);
@@ -258,15 +273,16 @@ public class SparkJobService {
 
     private GoldPriceFact convertNestedRowToEntity(Row row) {
         try {
-            String buyStr = row.getAs("buy_raw");   // ví dụ "66.100" hoặc "52.650"
+            String buyStr = row.getAs("buy_raw"); // ví dụ "66.100" hoặc "52.650"
             String sellStr = row.getAs("sell_raw");
             String branch = row.getAs("branch_name"); // "TPHCM", "Miền Tây", "Hà Nội", ...
-            String type = row.getAs("type_name");   // "PNJ", "SJC", ...
-            String dateRaw = row.getAs("date_raw");    // "yyyyMMdd" -> "20221001"
-            String updated = row.getAs("updated_at");  // "dd/MM/yyyy HH:mm:ss"
+            String type = row.getAs("type_name"); // "PNJ", "SJC", ...
+            String dateRaw = row.getAs("date_raw"); // "yyyyMMdd" -> "20221001"
+            String updated = row.getAs("updated_at"); // "dd/MM/yyyy HH:mm:ss"
             String typeRaw = (String) Optional.ofNullable(row.getAs("type_name")).orElse("");
 
-            if (dateRaw == null || buyStr == null || sellStr == null) return null;
+            if (dateRaw == null || buyStr == null || sellStr == null)
+                return null;
 
             // Chuẩn hoá số: "66.400" hoặc "26,620" -> về đơn vị nghìn, rồi *1000 => VNĐ
             double buyVnd = parsePriceVnd(buyStr);
@@ -277,7 +293,8 @@ public class SparkJobService {
             fact.setSellPrice(sellVnd);
             fact.setUnit("VNĐ/Lượng");
 
-            // SourceDimension: PNJ/SJC là loại vàng, còn nguồn bạn có thể đặt "Crawl PNJ/SJC"
+            // SourceDimension: PNJ/SJC là loại vàng, còn nguồn bạn có thể đặt "Crawl
+            // PNJ/SJC"
             SourceDimension src = sourceDimensionRepository.findBySourceName("Crawl PNJ/SJC")
                     .orElseGet(() -> {
                         SourceDimension s = new SourceDimension();
@@ -302,7 +319,7 @@ public class SparkJobService {
             String region = "Unknown";
             double bestScore = 0.0;
 
-// 🎯 Tìm tỉnh có similarity cao nhất
+            // 🎯 Tìm tỉnh có similarity cao nhất
             for (Map.Entry<String, String> e : LocationMap.regionMap.entrySet()) {
                 double sim = LevenshteinUtil.levenshteinSimilarity(normBranch, e.getKey().toLowerCase());
                 if (sim > bestScore) {
@@ -312,7 +329,7 @@ public class SparkJobService {
                 }
             }
 
-// 🎯 Ngưỡng 0.75: nếu không đủ tương đồng, fallback bằng từ khóa “miền”
+            // 🎯 Ngưỡng 0.75: nếu không đủ tương đồng, fallback bằng từ khóa “miền”
             if (bestScore < 0.75) {
                 if (normBranch.contains("miền tây")) {
                     region = "Miền Tây";
@@ -336,11 +353,11 @@ public class SparkJobService {
                 }
             }
 
-// 🧾 Debug log
+            // 🧾 Debug log
             log.debug("🗺️ Chuẩn hoá location='{}' → city='{}', region='{}' (score={})",
                     branch, city, region, String.format("%.2f", bestScore));
 
-// 🔍 Tìm trong DB hoặc tạo mới
+            // 🔍 Tìm trong DB hoặc tạo mới
             Optional<LocationDimension> existingLoc;
             if (!"Unknown".equals(city) && !"Unknown".equals(region)) {
                 existingLoc = locationDimensionRepository.findByCityIsAndRegionIs(city, region);
@@ -369,8 +386,7 @@ public class SparkJobService {
                 try {
                     LocalDateTime ldt = LocalDateTime.parse(
                             updated,
-                            DateTimeFormatter.ofPattern("dd/MM/yyyy HH:mm:ss")
-                    );
+                            DateTimeFormatter.ofPattern("dd/MM/yyyy HH:mm:ss"));
                     hour = ldt.getHour();
                 } catch (Exception ignore) {
                 }
@@ -398,11 +414,13 @@ public class SparkJobService {
     }
 
     private long parsePriceVnd(String s) {
-        if (s == null) return 0L;
+        if (s == null)
+            return 0L;
         // bỏ dấu . , và khoảng trắng
         String digits = s.replace(".", "").replace(",", "").replace(" ", "");
-        if (digits.isEmpty() || !digits.matches("\\d+")) return 0L;
+        if (digits.isEmpty() || !digits.matches("\\d+"))
+            return 0L;
         long thousands = Long.parseLong(digits); // ví dụ "66400" nghìn
-        return thousands * 1000L;                // -> 66,400,000 VNĐ
+        return thousands * 1000L; // -> 66,400,000 VNĐ
     }
 }

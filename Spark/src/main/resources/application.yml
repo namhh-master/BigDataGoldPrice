@@ -19,4 +19,6 @@ spring:
 
 spark:
   master: local[*]
-  hdfs-uri: hdfs://192.168.38.88:9000  # dùng IP thực thay vì localhost
+  hdfs-uri: hdfs://34.50.71.0:9000  # dùng IP thực thay vì localhost
+  sjc-path: /sjc_prices.json # Đường dẫn file trên HDFS
+  pnj-path: /pnj_gold.json # Đường dẫn file trên HDFS
