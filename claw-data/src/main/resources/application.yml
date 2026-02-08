@@ -7,7 +7,7 @@ server:
   port: 8081
 app:
   endpoint: "https://sjc.com.vn/GoldPrice/Services/PriceService.ashx"
-  to-date: "01/11/2025"
+  to-date: "20/01/2026"
   days: 365
   output-dir: "data/sjc"
   csv-file: "data/sjc/sjc_prices.csv"
